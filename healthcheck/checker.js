@@ -1,6 +1,6 @@
 import fetch from "node-fetch"; // or built-in fetch in Node 18+
 
-function startHealthCheck(url) {
+export function startHealthCheck(url) {
     async function ping() {
         try {
             const res = await fetch(url, { method: "GET" });
@@ -11,7 +11,7 @@ function startHealthCheck(url) {
 
         // schedule next ping randomly within 10 minutes
         const nextDelayMs = Math.floor(Math.random() * 10 * 60 * 1000);
-        console.log(`[HealthCheck] Next check in ${(nextDelayMs / 1000 / 60).toFixed(2)} min`);
+        console.log(`[FateCheck] Next check in ${(nextDelayMs / 1000 / 60).toFixed(2)} min`);
         setTimeout(ping, nextDelayMs);
     }
 

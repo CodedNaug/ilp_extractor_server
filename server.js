@@ -4,7 +4,8 @@ import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { FATE_SERVER } from "./constants/api";
+import { startHealthCheck } from "./healthcheck/checker.js";
+import { FATE_SERVER } from "./constants/api.js";
 
 dotenv.config();
 
@@ -146,6 +147,6 @@ app.post("/extract", upload.single("pdf"), async (req, res) => {
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  await ensureCache(); // try to warm cache on boot
+  // await ensureCache(); // try to warm cache on boot
   startHealthCheck(`${FATE_SERVER}/fateCheck`);
 });
