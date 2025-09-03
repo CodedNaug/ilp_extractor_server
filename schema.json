@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ILPPolicyExtraction",
+  "type": "object",
+  "properties": {
+    "product_name": {
+      "type": "string"
+    },
+    "issuer": {
+      "type": "string"
+    },
+    "monthly_premium_min_sgd": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "allocation_schedule_pct": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "year": {
+            "type": "integer"
+          },
+          "alloc_pct": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "year",
+          "alloc_pct"
+        ]
+      }
+    },
+    "welcome_bonus_pct": {
+      "type": "number"
+    },
+    "campaign_bonus_pct": {
+      "type": "number"
+    },
+    "loyalty_bonus_pct": {
+      "type": "number"
+    },
+    "premium_bonus_pct": {
+      "type": "number"
+    },
+    "headline_gross_return_pct": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "product_name",
+    "issuer",
+    "allocation_schedule_pct",
+    "welcome_bonus_pct",
+    "campaign_bonus_pct",
+    "loyalty_bonus_pct",
+    "premium_bonus_pct",
+    "headline_gross_return_pct"
+  ],
+  "additionalProperties": false
+}

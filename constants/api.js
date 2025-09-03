@@ -1,0 +1,1 @@
+export const FATE_SERVER = "https://fate-server.onrender.com"
