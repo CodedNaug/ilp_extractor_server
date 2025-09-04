@@ -1,17 +1,23 @@
+
 import express from "express";
 import multer from "multer";
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI, createPartFromUri } from "@google/genai";
+import mammoth from "mammoth";
+
+// If these exist in your project, they'll work; otherwise the try/catch below prevents crashes.
 import { startHealthCheck } from "./healthcheck/checker.js";
 import { FATE_SERVER } from "./constants/api.js";
 
 dotenv.config();
 
 const PORT = process.env.PORT || 8080;
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
-const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60 * 60 * 24 * 30); // default 30d
+// Cheapest default; override via env if you want full flash
+const MODEL = process.env.MODEL || "gemini-2.5-flash-lite";
+// Keep the inline payload small enough to stay under ~20MB request after base64 + prompt
+const MAX_INLINE_BYTES = Number(process.env.MAX_INLINE_BYTES || 14 * 1024 * 1024);
 
 const app = express();
 app.use(express.json());
@@ -19,121 +25,141 @@ app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
 const SCHEMA_PATH = path.resolve("./schema.json");
-const PROMPT_PATH = path.resolve("./ilp_extraction_prompt.txt");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Prefer GOOGLE_API_KEY, fallback GEMINI_API_KEY
+const API_KEY = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-// Keep cache name in memory (and persist to file for restarts)
-const CACHE_META_PATH = path.resolve("./.cache.json");
-let cachedName = null;
+const IMAGE_MIMES = new Set([
+  "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif",
+]);
+const TEXTY_MIMES = new Set([
+  "text/plain", "text/csv", "application/json",
+]);
+const DIRECT_DOC_MIMES = new Set([
+  "application/pdf",
+]);
+
+// Compact, cheap system instruction (no caching needed)
+const MICRO_PROMPT = `Return ONLY JSON that matches responseSchema.
+Percents as 55 (not 0.55), round ≤2dp.
+Missing required → 0. allocation_schedule_pct must be exactly 3 items: {year:1},{year:2},{year:3}. If unknown use [40,80,95].
+Bonuses: pick tier for S$12k/yr if banded; else headline.
+headline_gross_return_pct: use marketed illustration (if multiple, use higher).
+Source precedence: Contract/Product Summary/PHS > brochure > fund factsheet.
+Ignore COI/riders/switch/surrender/fees.`;
 
 async function loadSchema() {
   const raw = await fs.readFile(SCHEMA_PATH, "utf-8");
   return JSON.parse(raw);
 }
 
-async function ensureCache() {
-  try {
-    // If we have a stored cache name, use it
-    try {
-      const raw = await fs.readFile(CACHE_META_PATH, "utf-8");
-      const meta = JSON.parse(raw);
-      if (meta && meta.name) {
-        cachedName = meta.name;
-        return cachedName;
-      }
-    } catch { }
+// Build model "parts" from an uploaded file (type + size aware)
+async function buildPartsFromUpload(file) {
+  const mt = file.mimetype;
+  const size = file.size || file.buffer?.length || 0;
 
-    // Create a new cache from prompt
-    const prompt = await fs.readFile(PROMPT_PATH, "utf-8");
-    const caches = genAI.caches;
-    const created = await caches.create({
-      model: MODEL,
-      displayName: "ilp_extraction_rules_v1",
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      ttlSeconds: CACHE_TTL_SECONDS,
-    });
-    cachedName = created.name;
-    await fs.writeFile(CACHE_META_PATH, JSON.stringify({ name: cachedName }, null, 2), "utf-8");
-    return cachedName;
-  } catch (err) {
-    console.error("Cache creation failed (continuing without cache):", err?.message || err);
-    cachedName = null;
-    return null;
+  // 1) PDFs & images → inline if small, else Files API
+  if (DIRECT_DOC_MIMES.has(mt) || IMAGE_MIMES.has(mt)) {
+    if (size <= MAX_INLINE_BYTES) {
+      return [{ inlineData: { mimeType: mt, data: file.buffer.toString("base64") } }];
+    }
+    const tmp = `/tmp/${Date.now()}-${(file.originalname || "upload").replace(/\s+/g, "_")}`;
+    await fs.writeFile(tmp, file.buffer);
+    try {
+      const uploaded = await ai.files.upload({ file: tmp, config: { mimeType: mt } });
+      return [createPartFromUri(uploaded.uri, uploaded.mimeType)];
+    } finally {
+      await fs.unlink(tmp).catch(() => { });
+    }
   }
+
+  // 2) Text-like → send as text if small, else Files API
+  if (TEXTY_MIMES.has(mt)) {
+    if (size <= MAX_INLINE_BYTES) {
+      const txt = file.buffer.toString("utf-8");
+      return [{ text: txt }];
+    }
+    const tmp = `/tmp/${Date.now()}-${(file.originalname || "upload.txt").replace(/\s+/g, "_")}`;
+    await fs.writeFile(tmp, file.buffer);
+    try {
+      const uploaded = await ai.files.upload({ file: tmp, config: { mimeType: mt } });
+      return [createPartFromUri(uploaded.uri, uploaded.mimeType)];
+    } finally {
+      await fs.unlink(tmp).catch(() => { });
+    }
+  }
+
+  // 3) DOCX → extract to text (pure JS) → send as text
+  if (mt === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    const { value } = await mammoth.extractRawText({ buffer: file.buffer });
+    const txt = (value || "").trim();
+    if (!txt) throw new Error("DOCX parsed but produced empty text.");
+    return [{ text: txt }];
+  }
+
+  const supported = [
+    ...DIRECT_DOC_MIMES,
+    ...IMAGE_MIMES,
+    ...TEXTY_MIMES,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document (DOCX)",
+  ];
+  throw new Error(`Unsupported file type: \${mt}. Supported: \${supported.join(", ")}. Convert PPTX/others to PDF or TXT first.`);
 }
 
-app.get("/ilpCheck", (req, res) => {
-  res.json({ ok: true, model: MODEL, cached: Boolean(cachedName) });
+// Accept both field names: "file" (preferred) and "pdf" (legacy)
+const uploadEither = upload.fields([{ name: "file", maxCount: 1 }, { name: "pdf", maxCount: 1 }]);
+function getUploadedFile(req) {
+  return (req.files && req.files.file && req.files.file[0]) ||
+    (req.files && req.files.pdf && req.files.pdf[0]) ||
+    req.file || null;
+}
+
+app.get("/ilpCheck", (_req, res) => {
+  res.json({ ok: true, model: MODEL, maxInlineBytes: MAX_INLINE_BYTES });
 });
 
-app.post("/cache/rebuild", async (req, res) => {
-  try {
-    await fs.unlink(CACHE_META_PATH).catch(() => { });
-    const name = await ensureCache();
-    res.json({ ok: true, cachedContent: name });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+// JS-only: wrap Multer to avoid TS overload issues in mixed projects
+function uploadEitherWrapped(req, res, next) {
+  uploadEither(req, res, (err) => {
+    if (err) return res.status(400).json({ error: String(err) });
+    next();
+  });
+}
 
-app.post("/extract", upload.single("pdf"), async (req, res) => {
+app.post("/extract", uploadEitherWrapped, async (req, res) => {
   try {
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(400).json({ error: "Missing GEMINI_API_KEY" });
-    }
-    const file = req.file;
+    if (!API_KEY) return res.status(400).json({ error: "Missing GOOGLE_API_KEY (or GEMINI_API_KEY)" });
+
+    const file = getUploadedFile(req);
     if (!file) {
-      return res.status(400).json({ error: "Upload a PDF in form-data with field name 'pdf'." });
-    }
-    if (file.mimetype !== "application/pdf") {
-      return res.status(400).json({ error: "Only application/pdf is supported." });
+      return res.status(400).json({ error: "Upload in multipart/form-data under field 'file' (or legacy 'pdf')." });
     }
 
-    // Ensure we have cache (optional; proceed even if fails)
-    await ensureCache();
-
+    const fileParts = await buildPartsFromUpload(file);
     const schema = await loadSchema();
-    const model = genAI.getGenerativeModel({
+
+    const result = await ai.models.generateContent({
       model: MODEL,
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: schema
-      },
-      systemInstruction: "Return ONLY JSON per the response schema."
-    });
-
-    const inlineData = {
-      mimeType: "application/pdf",
-      data: file.buffer.toString("base64"),
-    };
-
-    const request = {
       contents: [{
         role: "user",
         parts: [
           { text: "Extract the required fields for the calculator." },
-          { inlineData }
+          ...fileParts
         ]
-      }]
-    };
+      }],
+      config: {
+        systemInstruction: { role: "user", parts: [{ text: MICRO_PROMPT }] },
+        responseMimeType: "application/json",
+        responseSchema: schema,
+      }
+    });
 
-    if (cachedName) {
-      request.cachedContent = cachedName;
-    } else {
-      // If cache failed, prepend the full prompt inline as a fallback
-      const prompt = await fs.readFile(PROMPT_PATH, "utf-8");
-      request.contents[0].parts.unshift({ text: prompt });
-    }
-
-    const result = await model.generateContent(request);
-    const text = result?.response?.text?.() || "{}";
-
-    // Validate JSON parsing
+    const text = result?.text || "{}";
     let payload;
     try {
       payload = JSON.parse(text);
-    } catch (e) {
+    } catch {
       return res.status(502).json({ error: "Model did not return valid JSON", raw: text });
     }
 
@@ -144,9 +170,11 @@ app.post("/extract", upload.single("pdf"), async (req, res) => {
   }
 });
 
-// Start server
 app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  // await ensureCache(); // try to warm cache on boot
-  startHealthCheck(`${FATE_SERVER}/fateCheck`);
+  try {
+    startHealthCheck(`${FATE_SERVER}/fateCheck`);
+  } catch (e) {
+    console.warn("Healthcheck not started:", e?.message || e);
+  }
 });
